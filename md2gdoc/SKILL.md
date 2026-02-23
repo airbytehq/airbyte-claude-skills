@@ -175,24 +175,13 @@ The `--drive-import-formats docx` flag tells rclone to convert the docx to a nat
 
 ### Step 6: Get the Google Doc URL
 
-Use `rclone lsjson` to reliably find the uploaded file. The file may be either a native Google Doc or a `.docx`, depending on whether rclone converted it:
+Use the `gdrive_utils.py` helper to find the uploaded file and get its URL. The script prefers native Google Docs over `.docx` files:
 
 ```bash
-FILE_ID=$(rclone lsjson "gdrive:${GDRIVE_FOLDER}" \
-  --include "${BASENAME}*" \
-  --no-modtime \
-  | python3 -c "
-import json, sys
-items = json.load(sys.stdin)
-# Prefer native Google Doc, fall back to .docx
-gdoc = next((i for i in items if i.get('MimeType') == 'application/vnd.google-apps.document'), None)
-docx = next((i for i in items if 'wordprocessingml' in i.get('MimeType', '')), None)
-found = gdoc or docx
-if found:
-    print(found['ID'])
-")
-DOC_URL="https://docs.google.com/document/d/${FILE_ID}/edit"
+python3 "${SKILL_DIR}/scripts/gdrive_utils.py" get-doc-url "${GDRIVE_FOLDER}" "${BASENAME}"
 ```
+
+The script prints the full Google Docs URL to stdout (e.g., `https://docs.google.com/document/d/{FILE_ID}/edit`). Capture this as `DOC_URL` and extract the `FILE_ID` from the URL path (the segment between `/d/` and `/edit`).
 
 Return the URL to the user.
 
@@ -202,35 +191,13 @@ Switch the Google Doc to Pageless mode for a clean white background (removes the
 
 **Option A — Google Docs API (preferred, requires Docs API enabled):**
 
-If the rclone OAuth project has the Google Docs API enabled (not just Drive API), make a single API call:
+If the rclone OAuth project has the Google Docs API enabled (not just Drive API), use the helper script:
 
 ```bash
-# Refresh token and extract it
-rclone about gdrive: > /dev/null 2>&1
-ACCESS_TOKEN=$(rclone config dump | python3 -c "
-import json, sys
-config = json.load(sys.stdin)
-token = json.loads(config['gdrive']['token'])
-print(token['access_token'])
-")
-
-curl -s -X POST \
-  "https://docs.googleapis.com/v1/documents/${FILE_ID}:batchUpdate" \
-  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "requests": [{
-      "updateDocumentStyle": {
-        "documentStyle": {
-          "documentFormat": {
-            "documentMode": "PAGELESS"
-          }
-        },
-        "fields": "documentFormat"
-      }
-    }]
-  }'
+python3 "${SKILL_DIR}/scripts/gdrive_utils.py" set-pageless "${FILE_ID}"
 ```
+
+If the script exits with code 2, the Docs API is not enabled for this OAuth project — fall back to Option B or C.
 
 **Note:** rclone's built-in OAuth project only enables the Drive API. To use this option, configure rclone with your own GCP `client_id`/`client_secret` from a project that has both the Drive API and Docs API enabled.
 
