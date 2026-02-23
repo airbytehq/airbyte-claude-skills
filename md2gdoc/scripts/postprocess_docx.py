@@ -14,7 +14,6 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
 def add_cell_borders(cell, color="000000", size="4"):
@@ -233,7 +232,7 @@ def fix_code_blocks(doc):
 
 def fix_heading_hierarchy(doc):
     """
-    Ensure heading hierarchy matches the Airbyte template:
+    Normalize heading hierarchy to consistent styling:
     - H1: 20pt, black
     - H2: 16pt, black
     - H3: 14pt, #434343
