@@ -128,6 +128,11 @@ This step maps the user's markdown sections into the template structure:
 - All template sections are always present, even if empty
 - Code blocks are properly handled (headings inside code fences are ignored)
 
+**Low mapping rate**: If fewer than 50% of template sections are mapped, the user's document structure likely doesn't align well with the template. In this case:
+1. Show the user which sections mapped and which didn't
+2. Ask if they want to proceed as-is (unmapped content gets appended) or manually specify which of their sections should map to which template placeholders
+3. If the user provides manual mappings, edit the templated markdown accordingly before proceeding to Step 3
+
 **Custom metadata**: Use `--meta KEY VALUE` to pass arbitrary metadata that matches any `{{PLACEHOLDER}}` in the skeleton.
 
 ### Step 3: Convert markdown to docx with pandoc
@@ -232,14 +237,6 @@ If the Claude in Chrome MCP tools are available, open the Google Doc URL and run
 Report each check as **pass** / **warn** / **fail**. If any check fails, suggest whether the fix is:
 - **Automated** — a bug in the pipeline scripts that should be fixed
 - **Manual** — something the user should adjust in the Google Doc directly (e.g., images, custom formatting)
-
-### Step 9: Cleanup
-
-```bash
-rm -f "${TEMP_DIR}/${BASENAME}_pandoc.docx"
-```
-
-Keep the final docx, templated markdown, and cleaned markdown in case the user wants them.
 
 ## Template management
 
