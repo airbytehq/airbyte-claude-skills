@@ -10,18 +10,15 @@ Usage:
 
     source:         local .docx path or Google Drive file ID (with --download)
     template_name:  name for the cached template directory
-    --download:     treat source as a Google Drive file ID and download via rclone
+    --download:     treat source as a Google Drive file ID and download via Drive connector
     --templates-dir: override the default templates directory
 """
 
 import argparse
-import json
+import asyncio
 import re
 import shutil
-import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 from docx import Document
@@ -187,80 +184,34 @@ def generate_skeleton(structure: dict) -> str:
     return "\n".join(lines)
 
 
-def _get_gdrive_access_token() -> str:
-    """Extract a fresh OAuth access token from rclone's config.
-
-    Runs 'rclone about gdrive:' to force a token refresh, then
-    parses the token from 'rclone config dump'.
-
-    Raises FileNotFoundError, subprocess.TimeoutExpired, or RuntimeError.
-    """
-    subprocess.run(
-        ["rclone", "about", "gdrive:"],
-        capture_output=True, text=True, timeout=30,
-    )
-    result = subprocess.run(
-        ["rclone", "config", "dump"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"rclone config dump failed: {result.stderr}")
-
-    config = json.loads(result.stdout)
-    token_str = config.get("gdrive", {}).get("token", "")
-    if not token_str:
-        raise RuntimeError("No token found in rclone config for 'gdrive' remote")
-
-    token_data = json.loads(token_str)
-    access_token = token_data.get("access_token", "")
-    if not access_token:
-        raise RuntimeError("access_token field missing from rclone gdrive token")
-
-    return access_token
-
-
 def download_from_gdrive(file_id: str, output_path: str) -> bool:
-    """Download a Google Doc as .docx using the Drive REST API.
+    """Download a Google Doc as .docx via the Drive connector.
 
-    Uses the access token from rclone's config to call the Drive v3
-    export endpoint directly, avoiding the rclone path-resolution bug
-    where file IDs are treated as filesystem paths.
+    Uses the airbyte-agent-google-drive connector with .env credentials
+    to export a Google Doc as .docx format.
     """
-    try:
-        access_token = _get_gdrive_access_token()
-    except FileNotFoundError:
-        print("Error: rclone is not installed. Install it with: brew install rclone", file=sys.stderr)
-        return False
-    except subprocess.TimeoutExpired:
-        print("Error: rclone timed out while refreshing token", file=sys.stderr)
-        return False
-    except RuntimeError as e:
-        print(f"Error extracting access token: {e}", file=sys.stderr)
-        return False
-
-    export_url = (
-        f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
-        f"?mimeType=application/vnd.openxmlformats-officedocument"
-        f".wordprocessingml.document"
-    )
-    req = urllib.request.Request(
-        export_url,
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    from gdrive_auth import get_connector
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        print(f"Error downloading from Google Drive: HTTP {e.code} - {e.reason}", file=sys.stderr)
-        return False
-    except urllib.error.URLError as e:
-        print(f"Error connecting to Google Drive API: {e.reason}", file=sys.stderr)
+        connector = get_connector()
+    except Exception as e:
+        print(f"Error initializing Drive connector: {e}", file=sys.stderr)
         return False
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_path).write_bytes(data)
-    return True
+    async def _download():
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        await connector.files_export.download_local(
+            file_id=file_id,
+            mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            path=output_path,
+        )
+
+    try:
+        asyncio.run(_download())
+        return True
+    except Exception as e:
+        print(f"Error downloading from Google Drive: {e}", file=sys.stderr)
+        return False
 
 
 def main():
@@ -270,7 +221,7 @@ def main():
     parser.add_argument("source", help="Local .docx path or Google Drive file ID (with --download)")
     parser.add_argument("template_name", help="Name for the cached template")
     parser.add_argument("--download", action="store_true",
-                        help="Treat source as Google Drive file ID and download via rclone")
+                        help="Treat source as Google Drive file ID and download via Drive connector")
     parser.add_argument("--templates-dir", type=Path, default=DEFAULT_TEMPLATES_DIR,
                         help="Override the templates directory")
     args = parser.parse_args()

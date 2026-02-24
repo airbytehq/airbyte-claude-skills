@@ -10,20 +10,32 @@ Convert markdown files to professionally styled Google Docs using customizable t
 ## Prerequisites
 
 - `pandoc` must be installed: `brew install pandoc`
-- `python-docx` must be installed: `pip3 install python-docx`
-- `rclone` must be configured with a `gdrive:` remote (see /gdrive skill for setup)
-- Use `python3` from PATH (not `/usr/bin/python3`) — the system Python may lack `python-docx`
+- **Python venv** must be set up (one-time):
+
+```bash
+SKILL_DIR="$HOME/.claude/skills/md2gdoc"
+python3.13 -m venv "${SKILL_DIR}/.venv"
+"${SKILL_DIR}/.venv/bin/pip" install -r "${SKILL_DIR}/requirements.txt"
+```
+
+- **`.env` file** must exist at `~/.claude/skills/md2gdoc/.env` with Google OAuth credentials (copy from `.env.example`)
 
 ## Base directory
 
 ```
 ~/.claude/skills/md2gdoc/
   SKILL.md
+  requirements.txt           # Python deps (python-docx, airbyte-agent-google-drive)
+  .env                       # Google OAuth credentials (not committed)
+  .env.example               # Template for .env
+  .venv/                     # Python 3.13 virtual environment
   scripts/
+    gdrive_auth.py           # shared Google Drive auth helper
     preprocess_markdown.py   # strips preamble + converts ASCII art tables
     generate_template.py     # auto-generates skeleton from a .docx
     fit_to_template.py       # maps user content into any template structure
     postprocess_docx.py      # python-docx post-processor
+    gdrive_utils.py          # upload-docx, get-doc-url, get-access-token, set-pageless
   templates/                 # populated on first use (cached per template)
     <template-name>/
       reference.docx         # pandoc style reference
@@ -73,7 +85,7 @@ fi
 2. Run the generator:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/generate_template.py" \
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/generate_template.py" \
   "<FILE_ID>" \
   "<TEMPLATE_NAME>" \
   --download
@@ -86,11 +98,11 @@ python3 "${SKILL_DIR}/scripts/generate_template.py" \
 ### Step 1: Pre-process the markdown
 
 ```bash
-SKILL_DIR="$HOME/.claude/skills/md2gdoc/scripts"
+SKILL_DIR="$HOME/.claude/skills/md2gdoc"
 TEMP_DIR="/tmp/md2gdoc/work"
 mkdir -p "$TEMP_DIR"
 
-python3 "${SKILL_DIR}/preprocess_markdown.py" \
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/preprocess_markdown.py" \
   "$INPUT_MD" \
   "${TEMP_DIR}/${BASENAME}_clean.md"
 ```
@@ -106,7 +118,7 @@ SKILL_DIR="$HOME/.claude/skills/md2gdoc"
 TEMPLATE_DIR="${SKILL_DIR}/templates/${TEMPLATE_NAME}"
 TEMP_DIR="/tmp/md2gdoc/work"
 
-python3 "${SKILL_DIR}/scripts/fit_to_template.py" \
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/fit_to_template.py" \
   "${TEMP_DIR}/${BASENAME}_clean.md" \
   "${TEMPLATE_DIR}/skeleton.md" \
   "${TEMP_DIR}/${BASENAME}_templated.md" \
@@ -151,7 +163,7 @@ The `--reference-doc` flag pulls base styles (fonts, heading sizes, spacing) fro
 ### Step 4: Post-process the docx with python-docx
 
 ```bash
-python3 "${SKILL_DIR}/scripts/postprocess_docx.py" \
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/postprocess_docx.py" \
   "${TEMP_DIR}/${BASENAME}_pandoc.docx" \
   "${TEMP_DIR}/${BASENAME}.docx"
 ```
@@ -165,46 +177,41 @@ The post-processor fixes issues that pandoc/Google Docs import doesn't handle:
 - **Heading hierarchy**: H1=20pt black, H2=16pt black, H3=14pt #434343, H4=12pt #666666, H5/H6=11pt bold #666666
 - **Paragraph spacing**: Body text 8pt after + 1.15 line height, list items 2pt after + 1.15 line height, code blocks 8pt before/after group
 
-### Step 5: Upload to Google Drive
+### Step 5: Upload to Google Drive and get the URL
+
+Upload the .docx to Google Drive using the connector. The file is automatically converted to a native Google Doc on upload. The script prints the Google Docs edit URL to stdout.
 
 ```bash
-rclone copy "${TEMP_DIR}/${BASENAME}.docx" \
-  "gdrive:${GDRIVE_FOLDER}" \
-  --drive-import-formats docx \
-  --drive-allow-import-name-change -v
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/gdrive_utils.py" upload-docx "${TEMP_DIR}/${BASENAME}.docx" "${GDRIVE_FOLDER}"
 ```
 
-The `--drive-import-formats docx` flag tells rclone to convert the docx to a native Google Doc on upload. The `--drive-allow-import-name-change` flag allows the `.docx` extension to be dropped during conversion.
-
-**Note:** Depending on the rclone version, the file may upload as a `.docx` without converting. Google Docs can open `.docx` files natively, so this is fine — the URL still works.
-
-### Step 6: Get the Google Doc URL
-
-Use the `gdrive_utils.py` helper to find the uploaded file and get its URL. The script prefers native Google Docs over `.docx` files:
+If `GDRIVE_FOLDER` is empty or `/`, omit the folder argument to upload to the Drive root:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/gdrive_utils.py" get-doc-url "${GDRIVE_FOLDER}" "${BASENAME}"
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/gdrive_utils.py" upload-docx "${TEMP_DIR}/${BASENAME}.docx"
 ```
 
-The script prints the full Google Docs URL to stdout (e.g., `https://docs.google.com/document/d/{FILE_ID}/edit`). Capture this as `DOC_URL` and extract the `FILE_ID` from the URL path (the segment between `/d/` and `/edit`).
+Capture the output as `DOC_URL` and extract the `FILE_ID` from the URL path (the segment between `/d/` and `/edit`).
 
 Return the URL to the user.
 
-### Step 7: Switch to Pageless mode
+**Note:** The folder path is slash-separated (e.g., `"Tech Specs/Q1 2026"`) and each segment is resolved by name. The upload uses the Drive v3 multipart upload API with conversion to native Google Docs format.
+
+### Step 6: Switch to Pageless mode
 
 Switch the Google Doc to Pageless mode for a clean white background (removes the default page border/tint).
 
 **Option A — Google Docs API (preferred, requires Docs API enabled):**
 
-If the rclone OAuth project has the Google Docs API enabled (not just Drive API), use the helper script:
+If the GCP project behind the `.env` OAuth credentials has the Google Docs API enabled (not just Drive API), use the helper script:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/gdrive_utils.py" set-pageless "${FILE_ID}"
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/gdrive_utils.py" set-pageless "${FILE_ID}"
 ```
 
 If the script exits with code 2, the Docs API is not enabled for this OAuth project — fall back to Option B or C.
 
-**Note:** rclone's built-in OAuth project only enables the Drive API. To use this option, configure rclone with your own GCP `client_id`/`client_secret` from a project that has both the Drive API and Docs API enabled.
+**Note:** The GCP project behind the `.env` OAuth credentials must have both the Drive API and Docs API enabled for this option to work.
 
 **Option B — Chrome MCP tools (fallback):**
 
@@ -220,7 +227,7 @@ If the Claude in Chrome MCP tools are available, open the Google Doc URL and cli
 
 If neither option is available, tell the user they can switch to Pageless mode via **File → Page setup → Pageless** for a cleaner look.
 
-### Step 8: Evaluate the output
+### Step 7: Evaluate the output
 
 If the Claude in Chrome MCP tools are available, open the Google Doc URL and run through the quality checklist below. If the plugin is not connected, inform the user that installing the [Claude in Chrome extension](https://claude.ai/chrome) is recommended for automated QA evaluation, and provide the Google Doc URL so they can review manually.
 
@@ -251,7 +258,8 @@ ls ~/.claude/skills/md2gdoc/templates/
 Provide a Google Doc URL when invoking the skill, or run the generator directly:
 
 ```bash
-python3 ~/.claude/skills/md2gdoc/scripts/generate_template.py \
+SKILL_DIR="$HOME/.claude/skills/md2gdoc"
+"${SKILL_DIR}/.venv/bin/python3" "${SKILL_DIR}/scripts/generate_template.py" \
   "<GOOGLE_DOC_FILE_ID>" \
   "my-template" \
   --download
@@ -271,7 +279,7 @@ The skeleton is then used by `fit_to_template.py` to match user content to templ
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌─────────────────┐     ┌──────────────────┐     ┌─────────────┐
-│ Markdown     │────▶│ Fit to       │────▶│ pandoc          │────▶│ python-docx      │────▶│ rclone      │
+│ Markdown     │────▶│ Fit to       │────▶│ pandoc          │────▶│ python-docx      │────▶│ Drive API   │
 │ (pre-process │     │ template     │     │ --reference-doc │     │ post-processor   │     │ upload +    │
 │  ASCII tables│     │ (section map │     │ (base styles)   │     │ (borders, code   │     │ convert to  │
 │  → md tables)│     │  + metadata) │     │                 │     │  blocks, heads)  │     │ Google Doc  │

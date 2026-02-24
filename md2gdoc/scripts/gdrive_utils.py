@@ -1,97 +1,136 @@
 """Google Drive utility commands for the md2gdoc skill.
 
-Replaces inline bash $() substitutions in SKILL.md that break in
-some shell environments (e.g., zsh with scm_breeze).
+Uses the airbyte-agent-google-drive connector for all Drive operations
+and urllib for the Docs API (set-pageless).
 
 Subcommands:
-    get-doc-url <gdrive_folder> <basename>
+    upload-docx <docx_path> [folder_path]
+        Upload a .docx file to Google Drive, converting to native Google Doc.
+        Prints the Google Docs edit URL to stdout.
+        folder_path is a slash-separated path like "Tech Specs/Q1 2026".
+        Defaults to root if omitted.
+
+    get-doc-url <folder_path> <basename>
         Find an uploaded file in Google Drive and print its Google Docs URL.
 
     get-access-token
-        Extract a fresh OAuth access token from rclone config.
+        Get a fresh OAuth access token from .env credentials.
 
     set-pageless <file_id>
         Set a Google Doc to pageless mode via the Docs API.
 
 Usage:
-    python3 gdrive_utils.py get-doc-url "My Folder" "my-spec"
+    python3 gdrive_utils.py upload-docx /tmp/spec.docx "Tech Specs"
+    python3 gdrive_utils.py get-doc-url "Tech Specs" "my-spec"
     python3 gdrive_utils.py get-access-token
     python3 gdrive_utils.py set-pageless "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
 """
 
+import asyncio
+import base64
 import json
-import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+from gdrive_auth import get_access_token as _get_access_token, get_connector
 
 
-def _get_access_token() -> str:
-    """Extract a fresh OAuth access token from rclone config.
+async def _resolve_folder_id(connector, folder_path: str) -> str:
+    """Resolve a slash-separated folder path to a Google Drive folder ID.
 
-    Runs 'rclone about gdrive:' to force token refresh, then
-    parses the token from 'rclone config dump'.
+    E.g. "Tech Specs/Q1 2026" -> resolves "Tech Specs" under root, then "Q1 2026" inside it.
+    Returns the final folder's ID.
     """
-    subprocess.run(
-        ["rclone", "about", "gdrive:"],
-        capture_output=True, text=True, timeout=30,
+    parent_id = "root"
+    parts = [p.strip() for p in folder_path.split("/") if p.strip()]
+
+    for part in parts:
+        q = (
+            f"name = '{part}' and '{parent_id}' in parents "
+            f"and mimeType = 'application/vnd.google-apps.folder' "
+            f"and trashed = false"
+        )
+        result = await connector.files.list(q=q, page_size=1, fields="files(id,name)")
+        files = result.data
+        if not files:
+            print(f"Error: folder '{part}' not found under parent '{parent_id}'", file=sys.stderr)
+            sys.exit(1)
+        parent_id = files[0].id
+
+    return parent_id
+
+
+async def _upload_docx(docx_path: str, folder_path: str | None) -> str:
+    """Upload a .docx file as a native Google Doc, return the edit URL."""
+    connector = get_connector()
+
+    file_bytes = Path(docx_path).read_bytes()
+    b64_content = base64.b64encode(file_bytes).decode("utf-8")
+    file_name = Path(docx_path).stem
+
+    kwargs = {}
+    if folder_path:
+        folder_id = await _resolve_folder_id(connector, folder_path)
+        kwargs["parents"] = [folder_id]
+
+    result = await connector.files_upload.create(
+        upload_type="multipart",
+        name=file_name,
+        mime_type="application/vnd.google-apps.document",
+        file_content=b64_content,
+        file_mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        **kwargs,
     )
-    result = subprocess.run(
-        ["rclone", "config", "dump"],
-        capture_output=True, text=True, timeout=10,
+    file_id = result["id"]
+    return f"https://docs.google.com/document/d/{file_id}/edit"
+
+
+def cmd_upload_docx(docx_path: str, folder_path: str | None = None) -> None:
+    """Upload a .docx to Drive as a native Google Doc. Prints edit URL."""
+    if not Path(docx_path).exists():
+        print(f"Error: file not found: {docx_path}", file=sys.stderr)
+        sys.exit(1)
+
+    url = asyncio.run(_upload_docx(docx_path, folder_path))
+    print(url)
+
+
+async def _get_doc_url(folder_path: str, basename: str) -> str:
+    """Find an uploaded file in a Drive folder and return its edit URL."""
+    connector = get_connector()
+
+    folder_id = await _resolve_folder_id(connector, folder_path)
+
+    q = (
+        f"name contains '{basename}' and '{folder_id}' in parents "
+        f"and trashed = false"
     )
-    if result.returncode != 0:
-        print(f"Error: rclone config dump failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    config = json.loads(result.stdout)
-    token_str = config.get("gdrive", {}).get("token", "")
-    if not token_str:
-        print("Error: no token found in rclone config for 'gdrive' remote", file=sys.stderr)
-        sys.exit(1)
-
-    token_data = json.loads(token_str)
-    access_token = token_data.get("access_token", "")
-    if not access_token:
-        print("Error: access_token field missing from rclone gdrive token", file=sys.stderr)
-        sys.exit(1)
-
-    return access_token
-
-
-def cmd_get_doc_url(gdrive_folder: str, basename: str) -> None:
-    """Find the uploaded file and print its Google Docs edit URL."""
-    result = subprocess.run(
-        [
-            "rclone", "lsjson",
-            f"gdrive:{gdrive_folder}",
-            "--include", f"{basename}*",
-            "--no-modtime",
-        ],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        print(f"Error: rclone lsjson failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    items = json.loads(result.stdout)
+    result = await connector.files.list(q=q, page_size=10, fields="files(id,name,mimeType)")
+    files = result.data
 
     gdoc = next(
-        (i for i in items if i.get("MimeType") == "application/vnd.google-apps.document"),
+        (f for f in files if f.mime_type == "application/vnd.google-apps.document"),
         None,
     )
     docx = next(
-        (i for i in items if "wordprocessingml" in i.get("MimeType", "")),
+        (f for f in files if f.mime_type and "wordprocessingml" in f.mime_type),
         None,
     )
     found = gdoc or docx
 
     if not found:
-        print(f"Error: no file matching '{basename}*' found in gdrive:{gdrive_folder}", file=sys.stderr)
+        print(f"Error: no file matching '{basename}' found in '{folder_path}'", file=sys.stderr)
         sys.exit(1)
 
-    file_id = found["ID"]
-    print(f"https://docs.google.com/document/d/{file_id}/edit")
+    return f"https://docs.google.com/document/d/{found.id}/edit"
+
+
+def cmd_get_doc_url(folder_path: str, basename: str) -> None:
+    """Find the uploaded file and print its Google Docs edit URL."""
+    url = asyncio.run(_get_doc_url(folder_path, basename))
+    print(url)
 
 
 def cmd_get_access_token() -> None:
@@ -135,7 +174,7 @@ def cmd_set_pageless(file_id: str) -> None:
         error_body = e.read().decode("utf-8", errors="replace")
         if e.code == 403:
             print(
-                f"Warning: Docs API returned 403. The rclone OAuth project may not have "
+                f"Warning: Docs API returned 403. The OAuth project may not have "
                 f"the Google Docs API enabled. Use Option B (Chrome MCP) or Option C "
                 f"(manual) instead.\nDetails: {error_body}",
                 file=sys.stderr,
@@ -152,14 +191,21 @@ def cmd_set_pageless(file_id: str) -> None:
 def main():
     if len(sys.argv) < 2:
         print("Usage: python3 gdrive_utils.py <subcommand> [args...]", file=sys.stderr)
-        print("Subcommands: get-doc-url, get-access-token, set-pageless", file=sys.stderr)
+        print("Subcommands: upload-docx, get-doc-url, get-access-token, set-pageless", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
 
-    if cmd == "get-doc-url":
+    if cmd == "upload-docx":
+        if len(sys.argv) < 3 or len(sys.argv) > 4:
+            print("Usage: python3 gdrive_utils.py upload-docx <docx_path> [folder_path]", file=sys.stderr)
+            sys.exit(1)
+        folder = sys.argv[3] if len(sys.argv) == 4 else None
+        cmd_upload_docx(sys.argv[2], folder)
+
+    elif cmd == "get-doc-url":
         if len(sys.argv) != 4:
-            print("Usage: python3 gdrive_utils.py get-doc-url <gdrive_folder> <basename>", file=sys.stderr)
+            print("Usage: python3 gdrive_utils.py get-doc-url <folder_path> <basename>", file=sys.stderr)
             sys.exit(1)
         cmd_get_doc_url(sys.argv[2], sys.argv[3])
 
@@ -174,7 +220,7 @@ def main():
 
     else:
         print(f"Unknown subcommand: {cmd}", file=sys.stderr)
-        print("Subcommands: get-doc-url, get-access-token, set-pageless", file=sys.stderr)
+        print("Subcommands: upload-docx, get-doc-url, get-access-token, set-pageless", file=sys.stderr)
         sys.exit(1)
 
 
